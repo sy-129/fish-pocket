@@ -1,0 +1,137 @@
+# 出未签名 IPA：同 ios-build.yml 的依赖步骤，但目标换成 generic/platform=iOS，
+# archive 时关掉签名，最后把 .app 装进 Payload/ 打成 ipa 传成 artifact。
+# 产物没签名，装到 iPhone 上要靠 Sideloadly / AltStore 用自己的证书重签。
+name: Unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      purge:
+        description: "构建前把 dsh-purge 补丁打进 engine（0/1）"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: engine/package-lock.json
+
+      - name: Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.2.app
+          xcodebuild -version
+
+      - name: Cache nodejs-mobile
+        id: nodejs-mobile
+        uses: actions/cache@v5
+        with:
+          path: |
+            vendor/nodejs-mobile/ios
+            vendor/nodejs-mobile/rooted
+          key: nodejs-mobile-${{ hashFiles('scripts/fetch-nodejs-mobile.sh') }}
+
+      - name: Fetch nodejs-mobile
+        if: steps.nodejs-mobile.outputs.cache-hit != 'true'
+        run: scripts/fetch-nodejs-mobile.sh
+
+      - name: Cache Python
+        id: python
+        uses: actions/cache@v5
+        with:
+          path: |
+            vendor/python/ios
+            vendor/python/rooted
+          key: python-${{ hashFiles('scripts/fetch-python.sh') }}
+
+      - name: Fetch Python
+        if: steps.python.outputs.cache-hit != 'true'
+        run: scripts/fetch-python.sh
+
+      - name: Check NodeMobile imports
+        run: scripts/check-root-imports.sh
+
+      - name: Cache libgit2
+        id: libgit2
+        uses: actions/cache@v5
+        with:
+          path: |
+            vendor/libgit2/Libgit2.xcframework
+            vendor/libgit2/ios-arm64
+            vendor/libgit2/ios-arm64-simulator
+            vendor/libgit2/macos
+          key: libgit2-${{ runner.os }}-${{ hashFiles('scripts/build-libgit2.sh') }}
+
+      - name: Build libgit2
+        if: steps.libgit2.outputs.cache-hit != 'true'
+        run: scripts/build-libgit2.sh
+
+      - name: Cache FFmpeg
+        id: ffmpeg
+        uses: actions/cache@v5
+        with:
+          path: vendor/ffmpeg/FFmpeg.xcframework
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('scripts/fetch-ffmpeg.sh', 'scripts/build-ffmpeg.sh', 'native/ffmpeg/**') }}
+
+      - name: Fetch FFmpeg
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: scripts/fetch-ffmpeg.sh
+
+      - name: Assemble engine
+        run: scripts/build-engine.sh
+
+      - name: Purge patch (optional)
+        if: ${{ inputs.purge == '1' }}
+        run: |
+          if [ -f scripts/patch-purge.sh ]; then
+            scripts/patch-purge.sh engine
+          else
+            echo "scripts/patch-purge.sh 不存在，跳过";
+          fi
+
+      - name: Generate project
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          cd app && xcodegen generate --quiet
+
+      - name: Archive (unsigned)
+        working-directory: app
+        run: |
+          xcodebuild -project DshIOS.xcodeproj -scheme DshIOS \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/DshIOS.xcarchive \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            archive | tail -80
+
+      - name: Package IPA
+        run: |
+          APP=$(find app/build/DshIOS.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
+          echo "app=$APP"
+          test -n "$APP"
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry DshIOS-unsigned.ipa Payload
+          ls -lh DshIOS-unsigned.ipa
+          echo "SHA256: $(shasum -a 256 DshIOS-unsigned.ipa)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DshIOS-unsigned-ipa
+          path: DshIOS-unsigned.ipa
+          retention-days: 30
