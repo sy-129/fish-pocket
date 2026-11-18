@@ -155,6 +155,44 @@ jobs:
           echo "=== 深度校验 ==="
           codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -20 || true
 
+      # 真正的问题不是"没签名"：codesign 把签名紧贴文件末尾，尾部剩余 0 字节。
+      # 侧载工具的证书签名（含 CMS 证书链）更大，只能扩槽改 Mach-O，
+      # 改完 CodeDirectory 覆盖范围与实际不符，报「CodeDirectory 与 Mach-O 不一致」。
+      # 对策：先用 ldid 把主程序的签名槽撑到 0x4000 对齐并留 pad，
+      # 再让 codesign 复用这个已放大的槽签整包（codesign 空间够就不缩回）。
+      - name: Pad signature slot with ldid
+        run: |
+          set -euo pipefail
+          APP=$(find app/build/DshIOS.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
+          EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          BIN="$APP/$EXE"
+          ENT=/tmp/empty.entitlements
+          echo "binary=$BIN"
+
+          command -v ldid >/dev/null || brew install ldid
+
+          printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict/></plist>' > "$ENT"
+
+          echo "=== 1) 撑大主程序签名槽 ==="
+          echo "  before: $(stat -f%z "$BIN") bytes"
+          codesign --remove-signature "$BIN" || true
+          ldid -S"$ENT" "$BIN"
+          echo "  after : $(stat -f%z "$BIN") bytes"
+          otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' || true
+
+          echo "=== 2) 递归签整包（复用已放大的槽）==="
+          find "$APP" -type d \( -name '*.framework' -o -name '*.appex' -o -name '*.app' \) -print \
+            | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2- \
+            | while IFS= read -r b; do codesign --force --sign - --timestamp=none "$b" >/dev/null 2>&1 || true; done
+          codesign --force --sign - --timestamp=none "$APP"
+
+          echo "=== 3) 结果 ==="
+          echo "  final: $(stat -f%z "$BIN") bytes"
+          otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' || true
+          codesign -d --verbose=2 "$APP" 2>&1 | head -12 || true
+          echo "=== 4) 校验 ==="
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -8 || true
+
       - name: Package IPA
         run: |
           APP=$(find app/build/DshIOS.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
