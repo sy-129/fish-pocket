@@ -119,6 +119,42 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             archive | tail -80
 
+      # 关键：archive 时用了 CODE_SIGNING_ALLOWED=NO，只有主可执行是裸的，
+      # 而 Frameworks 里 100 多个 Python/NodeMobile 框架都带着上游的 ad-hoc 签名。
+      # 侧载工具做递归校验时主程序没有 CodeDirectory，会报
+      # 「embedded 完整性校验失败 / 密封资源丢失」。
+      # 这里从最内层往外给每个 bundle 补 ad-hoc 签名，让整包签名状态一致。
+      - name: Ad-hoc sign (inside-out)
+        run: |
+          set -euo pipefail
+          APP=$(find app/build/DshIOS.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
+          echo "app=$APP"
+          test -n "$APP"
+
+          # 按路径长度倒序 = 最深的最先签，天然的由内向外
+          find "$APP" -type d \( -name '*.framework' -o -name '*.appex' -o -name '*.app' \) -print \
+            | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2- \
+            | while IFS= read -r b; do
+                codesign --force --sign - --timestamp=none "$b" >/dev/null 2>&1 \
+                  && echo "  ok  $b" || echo "  ERR $b"
+              done
+
+          # 独立的 dylib / so
+          find "$APP" -type f \( -name '*.dylib' -o -name '*.so' \) -print \
+            | while IFS= read -r f; do
+                codesign --force --sign - --timestamp=none "$f" >/dev/null 2>&1 \
+                  && echo "  ok  $f" || echo "  ERR $f"
+              done
+
+          # 最后签主 app 本体
+          codesign --force --sign - --timestamp=none "$APP"
+          echo
+          echo "=== 主 app 签名信息 ==="
+          codesign -dv --verbose=2 "$APP" 2>&1 | head -20
+          echo
+          echo "=== 深度校验 ==="
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -20 || true
+
       - name: Package IPA
         run: |
           APP=$(find app/build/DshIOS.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
