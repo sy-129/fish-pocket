@@ -111,32 +111,28 @@ jobs:
       - name: Archive (unsigned)
         working-directory: app
         run: |
+          set -o pipefail
           xcodebuild -project DshIOS.xcodeproj -scheme DshIOS \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath build/DshIOS.xcarchive \
             -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            archive | tail -80
+            archive 2>&1 | tee ../archive.log | tail -80
 
-      # 关键：archive 时就让 Xcode 自己用 ad-hoc 身份走完整 CodeSign phase。
-      # 这样 linker 会预留正确的签名空间，产出的包结构与 App Store 包同构，
-      # 侧载工具重签时不必扩槽改 Mach-O。
-      - name: Verify signature slot
+      - name: Verify unsigned archive baseline
         run: |
           set -euo pipefail
           APP=$(find app/build/DshIOS.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP"
           EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
           BIN="$APP/$EXE"
-          echo "binary=$BIN"
-          echo "filesize: $(stat -f%z "$BIN")"
-          echo "--- LC_CODE_SIGNATURE ---"
-          otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' || echo "  无签名段"
-          echo "--- codesign ---"
-          codesign -d --verbose=2 "$EXE" 2>&1 | head -14 || true
-          codesign -d --verbose=2 "$APP" 2>&1 | head -14 || true
-          echo "--- verify ---"
-          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -8 || true
+          test -f "$BIN"
+          echo "archive main executable: $(stat -f%z "$BIN") bytes"
+          otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' || echo "archive executable has no LC_CODE_SIGNATURE (expected before post-build signing)"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")" = "com.wsw.dsh-ios"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist")" = "17.0"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")" = "1.2.1"
 
       # Xcode 27 的 SDK 禁用 ad-hoc 签名（"Ad Hoc code signing is not allowed"），
       # 所以只能 CODE_SIGNING_ALLOWED=NO + 事后签。
@@ -153,9 +149,14 @@ jobs:
           echo "binary=$BIN"
 
           echo "=== 1) codesign 递签整包 ==="
-          find "$APP" -type d \( -name '*.framework' -o -name '*.appex' -o -name '*.app' \) -print \
+          find "$APP" -depth -type d \( -name '*.framework' -o -name '*.appex' \) -print0 \
+            | xargs -0 -n1 echo \
             | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2- \
-            | while IFS= read -r b; do codesign --force --sign - --timestamp=none "$b" >/dev/null 2>&1 || true; done
+            | while IFS= read -r bundle; do codesign --force --sign - --timestamp=none "$bundle"; done
+          find "$APP" -depth -type d -name '*.app' ! -path "$APP" -print0 \
+            | xargs -0 -n1 echo \
+            | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2- \
+            | while IFS= read -r bundle; do codesign --force --sign - --timestamp=none "$bundle"; done
           codesign --force --sign - --timestamp=none "$APP"
           echo "  after codesign: $(stat -f%z "$BIN") bytes"
           otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' | tail -3 || true
@@ -172,7 +173,11 @@ jobs:
           DOFF=$(otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' | awk '/dataoff/{print $2}')
           DSIZE=$(otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' | awk '/datasize/{print $2}')
           FS=$(stat -f%z "$BIN")
-          echo "  sig_off=$DOFF  sig_size=$DSIZE  filesize=$FS  tail_pad=$((FS - DOFF - DSIZE))"
+          TAIL=$((FS - DOFF - DSIZE))
+          echo "  sig_off=$DOFF  sig_size=$DSIZE  filesize=$FS  tail_pad=$TAIL"
+          test -n "$DOFF" && test -n "$DSIZE"
+          test "$DSIZE" -ge 200000
+          test "$TAIL" -ge 16384
 
       - name: Package IPA
         run: |
@@ -184,6 +189,24 @@ jobs:
           zip -qry DshIOS-unsigned.ipa Payload
           ls -lh DshIOS-unsigned.ipa
           echo "SHA256: $(shasum -a 256 DshIOS-unsigned.ipa)"
+          python3 - <<'PYVALIDATE'
+          import json, plistlib, zipfile
+          ipa = zipfile.ZipFile("DshIOS-unsigned.ipa")
+          names = set(ipa.namelist())
+          root = "Payload/DshIOS.app/"
+          assert root + "DshIOS" in names, "main executable missing from IPA"
+          info = plistlib.loads(ipa.read(root + "Info.plist"))
+          assert info["CFBundleIdentifier"] == "com.wsw.dsh-ios", info
+          assert float(info["MinimumOSVersion"]) <= 17.0, info
+          assert info["CFBundleShortVersionString"] == "1.2.1", info
+          prefix = root + "nodejs-project/node_modules/"
+          dsh = json.loads(ipa.read(prefix + "@deepseek-ai/dsh/package.json"))
+          version = dsh["version"]
+          assert version.startswith("0.2."), version
+          cordis = [n for n in names if n.startswith(prefix) and n.endswith("/cordis/package.json")]
+          assert cordis, "no cordis package found under bundled node_modules"
+          print("IPA validation:", {"bundle_id": info["CFBundleIdentifier"], "minimum_os": info["MinimumOSVersion"], "app_version": info["CFBundleShortVersionString"], "dsh_version": version, "cordis_packages": len(cordis)})
+          PYVALIDATE
 
       - uses: actions/upload-artifact@v4
         with:
