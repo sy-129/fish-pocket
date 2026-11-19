@@ -108,7 +108,7 @@ jobs:
           command -v xcodegen >/dev/null || brew install xcodegen
           cd app && xcodegen generate --quiet
 
-      - name: Archive (ad-hoc signed by Xcode)
+      - name: Archive (unsigned)
         working-directory: app
         run: |
           xcodebuild -project DshIOS.xcodeproj -scheme DshIOS \
@@ -116,9 +116,7 @@ jobs:
             -destination 'generic/platform=iOS' \
             -archivePath build/DshIOS.xcarchive \
             -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual \
-            PROVISIONING_PROFILE_SPECIFIER="" DEVELOPMENT_TEAM="" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             archive | tail -80
 
       # 关键：archive 时就让 Xcode 自己用 ad-hoc 身份走完整 CodeSign phase。
@@ -139,6 +137,42 @@ jobs:
           codesign -d --verbose=2 "$APP" 2>&1 | head -14 || true
           echo "--- verify ---"
           codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -8 || true
+
+      # Xcode 27 的 SDK 禁用 ad-hoc 签名（"Ad Hoc code signing is not allowed"），
+      # 所以只能 CODE_SIGNING_ALLOWED=NO + 事后签。
+      # 顺序很关键：先用 codesign 递签整包（生成正确 CodeResources），
+      # 最后用 ldid 单独重签主程序 —— ldid 会把签名槽按 0x4000 对齐撑大并留 pad，
+      # 这样侧载工具重签时不必扩槽改 Mach-O，也就不会再报 CodeDirectory 不一致。
+      # 代价：主程序的 CodeResources 条目失效，侧载工具重签时会自己重算。
+      - name: Sign and pad main executable
+        run: |
+          set -euo pipefail
+          APP=$(find app/build/DshIOS.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
+          EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          BIN="$APP/$EXE"
+          echo "binary=$BIN"
+
+          echo "=== 1) codesign 递签整包 ==="
+          find "$APP" -type d \( -name '*.framework' -o -name '*.appex' -o -name '*.app' \) -print \
+            | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2- \
+            | while IFS= read -r b; do codesign --force --sign - --timestamp=none "$b" >/dev/null 2>&1 || true; done
+          codesign --force --sign - --timestamp=none "$APP"
+          echo "  after codesign: $(stat -f%z "$BIN") bytes"
+          otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' | tail -3 || true
+
+          echo "=== 2) ldid 重签主程序，撑大签名槽 ==="
+          command -v ldid >/dev/null || brew install ldid
+          ENT=/tmp/empty.entitlements
+          printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict/></plist>' > "$ENT"
+          ldid -S"$ENT" "$BIN"
+          echo "  final: $(stat -f%z "$BIN") bytes"
+
+          echo "=== 3) 签名槽与余量 ==="
+          otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' | tail -4 || true
+          DOFF=$(otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' | awk '/dataoff/{print $2}')
+          DSIZE=$(otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' | awk '/datasize/{print $2}')
+          FS=$(stat -f%z "$BIN")
+          echo "  sig_off=$DOFF  sig_size=$DSIZE  filesize=$FS  tail_pad=$((FS - DOFF - DSIZE))"
 
       - name: Package IPA
         run: |
