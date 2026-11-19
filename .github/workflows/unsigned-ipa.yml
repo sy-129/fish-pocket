@@ -108,7 +108,7 @@ jobs:
           command -v xcodegen >/dev/null || brew install xcodegen
           cd app && xcodegen generate --quiet
 
-      - name: Archive (unsigned)
+      - name: Archive (ad-hoc signed by Xcode)
         working-directory: app
         run: |
           xcodebuild -project DshIOS.xcodeproj -scheme DshIOS \
@@ -116,81 +116,28 @@ jobs:
             -destination 'generic/platform=iOS' \
             -archivePath build/DshIOS.xcarchive \
             -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="" DEVELOPMENT_TEAM="" \
             archive | tail -80
 
-      # 关键：archive 时用了 CODE_SIGNING_ALLOWED=NO，只有主可执行是裸的，
-      # 而 Frameworks 里 100 多个 Python/NodeMobile 框架都带着上游的 ad-hoc 签名。
-      # 侧载工具做递归校验时主程序没有 CodeDirectory，会报
-      # 「embedded 完整性校验失败 / 密封资源丢失」。
-      # 这里从最内层往外给每个 bundle 补 ad-hoc 签名，让整包签名状态一致。
-      - name: Ad-hoc sign (inside-out)
-        run: |
-          set -euo pipefail
-          APP=$(find app/build/DshIOS.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
-          echo "app=$APP"
-          test -n "$APP"
-
-          # 按路径长度倒序 = 最深的最先签，天然的由内向外
-          find "$APP" -type d \( -name '*.framework' -o -name '*.appex' -o -name '*.app' \) -print \
-            | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2- \
-            | while IFS= read -r b; do
-                codesign --force --sign - --timestamp=none "$b" >/dev/null 2>&1 \
-                  && echo "  ok  $b" || echo "  ERR $b"
-              done
-
-          # 独立的 dylib / so
-          find "$APP" -type f \( -name '*.dylib' -o -name '*.so' \) -print \
-            | while IFS= read -r f; do
-                codesign --force --sign - --timestamp=none "$f" >/dev/null 2>&1 \
-                  && echo "  ok  $f" || echo "  ERR $f"
-              done
-
-          # 最后签主 app 本体
-          codesign --force --sign - --timestamp=none "$APP"
-          echo
-          echo "=== 主 app 签名信息 ==="
-          codesign -dv --verbose=2 "$APP" 2>&1 | head -20
-          echo
-          echo "=== 深度校验 ==="
-          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -20 || true
-
-      # 真正的问题不是"没签名"：codesign 把签名紧贴文件末尾，尾部剩余 0 字节。
-      # 侧载工具的证书签名（含 CMS 证书链）更大，只能扩槽改 Mach-O，
-      # 改完 CodeDirectory 覆盖范围与实际不符，报「CodeDirectory 与 Mach-O 不一致」。
-      # 对策：先用 ldid 把主程序的签名槽撑到 0x4000 对齐并留 pad，
-      # 再让 codesign 复用这个已放大的槽签整包（codesign 空间够就不缩回）。
-      - name: Pad signature slot with ldid
+      # 关键：archive 时就让 Xcode 自己用 ad-hoc 身份走完整 CodeSign phase。
+      # 这样 linker 会预留正确的签名空间，产出的包结构与 App Store 包同构，
+      # 侧载工具重签时不必扩槽改 Mach-O。
+      - name: Verify signature slot
         run: |
           set -euo pipefail
           APP=$(find app/build/DshIOS.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
           EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
           BIN="$APP/$EXE"
-          ENT=/tmp/empty.entitlements
           echo "binary=$BIN"
-
-          command -v ldid >/dev/null || brew install ldid
-
-          printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict/></plist>' > "$ENT"
-
-          echo "=== 1) 撑大主程序签名槽 ==="
-          echo "  before: $(stat -f%z "$BIN") bytes"
-          codesign --remove-signature "$BIN" || true
-          ldid -S"$ENT" "$BIN"
-          echo "  after : $(stat -f%z "$BIN") bytes"
-          otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' || true
-
-          echo "=== 2) 递归签整包（复用已放大的槽）==="
-          find "$APP" -type d \( -name '*.framework' -o -name '*.appex' -o -name '*.app' \) -print \
-            | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2- \
-            | while IFS= read -r b; do codesign --force --sign - --timestamp=none "$b" >/dev/null 2>&1 || true; done
-          codesign --force --sign - --timestamp=none "$APP"
-
-          echo "=== 3) 结果 ==="
-          echo "  final: $(stat -f%z "$BIN") bytes"
-          otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' || true
-          codesign -d --verbose=2 "$APP" 2>&1 | head -12 || true
-          echo "=== 4) 校验 ==="
+          echo "filesize: $(stat -f%z "$BIN")"
+          echo "--- LC_CODE_SIGNATURE ---"
+          otool -l "$BIN" | grep -A4 'LC_CODE_SIGNATURE' || echo "  无签名段"
+          echo "--- codesign ---"
+          codesign -d --verbose=2 "$EXE" 2>&1 | head -14 || true
+          codesign -d --verbose=2 "$APP" 2>&1 | head -14 || true
+          echo "--- verify ---"
           codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -8 || true
 
       - name: Package IPA
